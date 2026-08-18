@@ -18,6 +18,7 @@ import discord
 # ・指定カテゴリー内VCだけプロフィール表示
 # ・VCのインチャへ直接プロフィールカード投稿
 # ・「プロフィールを見る」で本人のプロフィール投稿へジャンプ
+# ・表示名検索対応
 # ============================================================
 
 
@@ -32,7 +33,7 @@ GUILD_ID = 1458016711344263170
 
 
 # ============================================================
-# ★ 新しい監視カテゴリー
+# 監視カテゴリー
 # ============================================================
 
 PROFILE_VOICE_CATEGORY_ID = 1469270048970375240
@@ -64,7 +65,7 @@ MOVE_SETTLE_SECONDS = 5.0
 # プロフィール検索で遡る件数
 PROFILE_SCAN_LIMIT = 3000
 
-# 同じVCで同じ人のプロフィールは1回だけ
+# 同じVCで同じ人のプロフィールは1回だけ表示
 POST_ONCE_PER_ROOM = True
 
 
@@ -115,7 +116,7 @@ settle_tasks: dict[int, asyncio.Task] = {}
 
 
 # ============================================================
-# チャンネル取得
+# 共通
 # ============================================================
 
 async def get_channel_safe(
@@ -144,8 +145,25 @@ async def get_channel_safe(
         return None
 
 
+def normalize_text(
+    text: str,
+) -> str:
+    """
+    比較用に文字列を正規化
+    """
+
+    return (
+        text
+        .strip()
+        .lower()
+        .replace(" ", "")
+        .replace("　", "")
+        .replace("\n", "")
+    )
+
+
 # ============================================================
-# 性別ロール判定
+# 性別ロール
 # ============================================================
 
 def member_gender(
@@ -194,7 +212,7 @@ def profile_channel_candidates(
             FEMALE_PROFILE_CHANNEL_ID
         ]
 
-    # 性別ロールなしの場合は両方検索
+    # 性別ロール無しなら男女両方検索
     return [
         MALE_PROFILE_CHANNEL_ID,
         FEMALE_PROFILE_CHANNEL_ID,
@@ -202,7 +220,7 @@ def profile_channel_candidates(
 
 
 # ============================================================
-# Embedを検索用テキストへ
+# Embedをテキスト化
 # ============================================================
 
 def embed_to_text(
@@ -221,13 +239,19 @@ def embed_to_text(
             embed.description
         )
 
-    if embed.author and embed.author.name:
+    if (
+        embed.author
+        and embed.author.name
+    ):
 
         parts.append(
             embed.author.name
         )
 
-    if embed.footer and embed.footer.text:
+    if (
+        embed.footer
+        and embed.footer.text
+    ):
 
         parts.append(
             embed.footer.text
@@ -236,11 +260,13 @@ def embed_to_text(
     for field in embed.fields:
 
         if field.name:
+
             parts.append(
                 field.name
             )
 
         if field.value:
+
             parts.append(
                 field.value
             )
@@ -259,26 +285,38 @@ def message_matches_member(
     member: discord.Member,
 ) -> bool:
 
-    # 本人が直接投稿
+    # ========================================================
+    # ① 本人が直接投稿
+    # ========================================================
+
     if (
         not message.author.bot
         and message.author.id == member.id
     ):
         return True
 
+
+    # ========================================================
+    # ② ID / メンション
+    # ========================================================
+
     user_id_text = str(
         member.id
     )
 
-    mention_1 = f"<@{member.id}>"
-    mention_2 = f"<@!{member.id}>"
+    mention_1 = (
+        f"<@{member.id}>"
+    )
+
+    mention_2 = (
+        f"<@!{member.id}>"
+    )
 
     content = (
         message.content
         or ""
     )
 
-    # 本文
     if (
         user_id_text in content
         or mention_1 in content
@@ -286,25 +324,123 @@ def message_matches_member(
     ):
         return True
 
-    # mentions
+
     for user in message.mentions:
 
         if user.id == member.id:
             return True
 
-    # embeds
+
+    # ========================================================
+    # ③ 名前候補を作る
+    # ========================================================
+
+    display_name = normalize_text(
+        member.display_name
+    )
+
+    username = normalize_text(
+        member.name
+    )
+
+    global_name = normalize_text(
+        member.global_name
+        or ""
+    )
+
+    name_candidates = {
+        display_name,
+        username,
+        global_name,
+    }
+
+    name_candidates.discard("")
+
+    profile_title_candidates = {
+        f"{name}のプロフィール"
+        for name in name_candidates
+    }
+
+
+    # ========================================================
+    # ④ 本文に表示名がある場合
+    # ========================================================
+
+    normalized_content = normalize_text(
+        content
+    )
+
+    for name in name_candidates:
+
+        if (
+            f"{name}のプロフィール"
+            in normalized_content
+        ):
+            return True
+
+
+    # ========================================================
+    # ⑤ Embed検索
+    # ========================================================
+
     for embed in message.embeds:
 
-        embed_text = embed_to_text(
+        # ----------------------------------------
+        # Embedタイトル
+        # ----------------------------------------
+
+        if embed.title:
+
+            title = normalize_text(
+                embed.title
+            )
+
+            # 例:
+            # coconaのプロフィール
+            if title in profile_title_candidates:
+                return True
+
+            # 少し表記揺れがあっても拾う
+            for name in name_candidates:
+
+                if (
+                    name
+                    and name in title
+                    and "プロフィール" in title
+                ):
+                    return True
+
+
+        # ----------------------------------------
+        # Embed全体
+        # ----------------------------------------
+
+        embed_text_raw = embed_to_text(
             embed
+        )
+
+        embed_text = normalize_text(
+            embed_text_raw
         )
 
         if (
             user_id_text in embed_text
-            or mention_1 in embed_text
-            or mention_2 in embed_text
+            or normalize_text(mention_1) in embed_text
+            or normalize_text(mention_2) in embed_text
         ):
             return True
+
+
+        # 表示名 + プロフィール
+        for name in name_candidates:
+
+            if (
+                name
+                and name in embed_text
+                and "プロフィール" in embed_text
+            ):
+                return True
+
 
     return False
 
@@ -319,6 +455,13 @@ async def find_profile_message(
 
     channel_ids = profile_channel_candidates(
         member
+    )
+
+    log.info(
+        "Searching profile | user=%s | display_name=%s | channels=%s",
+        member.id,
+        member.display_name,
+        channel_ids,
     )
 
     for channel_id in channel_ids:
@@ -341,6 +484,11 @@ async def find_profile_message(
             "history",
         ):
 
+            log.warning(
+                "Channel has no history(): %s",
+                channel_id,
+            )
+
             continue
 
         try:
@@ -360,9 +508,10 @@ async def find_profile_message(
                     ] = message.jump_url
 
                     log.info(
-                        "Profile found | user=%s | message=%s",
+                        "Profile found | user=%s | message=%s | url=%s",
                         member.id,
                         message.id,
+                        message.jump_url,
                     )
 
                     return message
@@ -381,6 +530,12 @@ async def find_profile_message(
                 channel_id,
             )
 
+    log.warning(
+        "Profile not found | user=%s | display_name=%s",
+        member.id,
+        member.display_name,
+    )
+
     return None
 
 
@@ -393,6 +548,12 @@ async def get_profile_url(
     )
 
     if cached:
+
+        log.info(
+            "Profile cache hit | user=%s",
+            member.id,
+        )
+
         return cached
 
     message = await find_profile_message(
@@ -574,9 +735,10 @@ async def post_profile_to_voice_chat(
         )
 
         log.info(
-            "Profile posted | room=%s | user=%s",
+            "Profile posted | room=%s | user=%s | found=%s",
             channel.id,
             member.id,
+            profile_url is not None,
         )
 
     except discord.Forbidden:
@@ -622,7 +784,6 @@ async def wait_for_final_voice_channel(
 
             return
 
-        # MemberをGuildから取り直す
         member = guild.get_member(
             member_id
         )
@@ -662,7 +823,6 @@ async def wait_for_final_voice_channel(
         channel = voice_state.channel
 
         if channel is None:
-
             return
 
         log.info(
@@ -679,7 +839,7 @@ async def wait_for_final_voice_channel(
 
             return
 
-        # ★ 新カテゴリーだけ監視
+        # 指定カテゴリー以外は無視
         if (
             channel.category_id
             != PROFILE_VOICE_CATEGORY_ID
@@ -773,7 +933,6 @@ async def on_voice_state_update(
     after: discord.VoiceState,
 ):
 
-    # まず全部ログへ出す
     log.info(
         "VOICE EVENT | user=%s | before=%s | after=%s",
         member.id,
@@ -790,7 +949,6 @@ async def on_voice_state_update(
     if before.channel == after.channel:
         return
 
-    # 前の待機タスクがあればキャンセル
     old_task = settle_tasks.get(
         member.id
     )
@@ -802,7 +960,6 @@ async def on_voice_state_update(
 
         old_task.cancel()
 
-    # 完全退出
     if after.channel is None:
 
         log.info(
@@ -812,7 +969,6 @@ async def on_voice_state_update(
 
         return
 
-    # 新しい移動先ができたら5秒待つ
     task = asyncio.create_task(
         wait_for_final_voice_channel(
             member.guild.id,
@@ -826,7 +982,7 @@ async def on_voice_state_update(
 
 
 # ============================================================
-# VC削除時に投稿履歴キャッシュ削除
+# VC削除時
 # ============================================================
 
 @client.event
@@ -856,7 +1012,7 @@ async def on_guild_channel_delete(
 
 
 # ============================================================
-# プロフィール投稿キャッシュ更新
+# 新しいプロフィール投稿をキャッシュ
 # ============================================================
 
 @client.event
@@ -876,12 +1032,13 @@ async def on_message(
     }:
         return
 
-    # 本人が直接プロフィール投稿
+    # 本人が直接投稿
     if not message.author.bot:
 
         profile_cache[
             message.author.id
         ] = message.jump_url
+
 
     # メンション
     for user in message.mentions:
@@ -890,7 +1047,8 @@ async def on_message(
             user.id
         ] = message.jump_url
 
-    # 本文 + Embed
+
+    # ID検索
     searchable_text = (
         message.content
         or ""
