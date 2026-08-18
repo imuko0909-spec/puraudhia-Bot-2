@@ -12,12 +12,12 @@ import discord
 # ============================================================
 # Puraudhia プロフィール表示専用Bot
 #
-# ・VC生成はしない
-# ・パネル設置もしない
-# ・シャベレアで自動移動された「最終VC」を監視
-# ・対象カテゴリー内のVCだけプロフィール表示
-# ・VCのインチャへ直接プロフィールカードを投稿
-# ・「プロフィールを見る」で本人のプロフィールへジャンプ
+# ・VC生成しない
+# ・パネル設置しない
+# ・シャベレアで自動移動された最終VCを監視
+# ・指定カテゴリー内VCだけプロフィール表示
+# ・VCのインチャへ直接プロフィールカード投稿
+# ・「プロフィールを見る」で本人のプロフィール投稿へジャンプ
 # ============================================================
 
 
@@ -25,22 +25,17 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
 
 # ============================================================
-# Puraudhia 設定
+# Puraudhia
 # ============================================================
 
 GUILD_ID = 1458016711344263170
 
 
 # ============================================================
-# プロフィール表示対象カテゴリー
+# ★ 新しい監視カテゴリー
 # ============================================================
 
-PROFILE_VOICE_CATEGORY_IDS = {
-    1519531377811259392,
-    1519531975231279176,
-    1519531583210655854,
-    1519531758809518212,
-}
+PROFILE_VOICE_CATEGORY_ID = 1469270048970375240
 
 
 # ============================================================
@@ -63,13 +58,13 @@ FEMALE_ROLE_ID = 1458022601258700800
 # 動作設定
 # ============================================================
 
-# シャベレアの自動移動が終わるまで待つ時間
-MOVE_SETTLE_SECONDS = 3.0
+# シャベレアの自動移動が完了するまで待つ
+MOVE_SETTLE_SECONDS = 5.0
 
-# プロフィール検索で遡る最大投稿数
+# プロフィール検索で遡る件数
 PROFILE_SCAN_LIMIT = 3000
 
-# 同じVCで同じ人のプロフィールは1回だけ表示
+# 同じVCで同じ人のプロフィールは1回だけ
 POST_ONCE_PER_ROOM = True
 
 
@@ -82,9 +77,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-log = logging.getLogger(
-    "puraudhia-profile"
-)
+log = logging.getLogger("puraudhia-profile")
 
 
 # ============================================================
@@ -95,8 +88,6 @@ intents = discord.Intents.default()
 
 intents.guilds = True
 intents.voice_states = True
-
-# プロフィール投稿本文・EmbedからIDを探すために必要
 intents.message_content = True
 
 
@@ -113,23 +104,24 @@ client = discord.Client(
 # キャッシュ
 # ============================================================
 
-# user_id -> profile URL
+# user_id -> profile jump URL
 profile_cache: dict[int, str] = {}
 
 # (voice_channel_id, user_id)
 posted_in_room: set[tuple[int, int]] = set()
 
-# ユーザーごとの「移動確定待ち」タスク
+# user_id -> asyncio.Task
 settle_tasks: dict[int, asyncio.Task] = {}
 
 
 # ============================================================
-# 共通関数
+# チャンネル取得
 # ============================================================
 
 async def get_channel_safe(
     channel_id: int,
 ):
+
     channel = client.get_channel(
         channel_id
     )
@@ -138,6 +130,7 @@ async def get_channel_safe(
         return channel
 
     try:
+
         return await client.fetch_channel(
             channel_id
         )
@@ -147,8 +140,13 @@ async def get_channel_safe(
         discord.Forbidden,
         discord.HTTPException,
     ):
+
         return None
 
+
+# ============================================================
+# 性別ロール判定
+# ============================================================
 
 def member_gender(
     member: discord.Member,
@@ -159,20 +157,18 @@ def member_gender(
         for role in member.roles
     }
 
-    male = (
-        MALE_ROLE_ID
-        in role_ids
+    has_male = (
+        MALE_ROLE_ID in role_ids
     )
 
-    female = (
-        FEMALE_ROLE_ID
-        in role_ids
+    has_female = (
+        FEMALE_ROLE_ID in role_ids
     )
 
-    if male and not female:
+    if has_male and not has_female:
         return "male"
 
-    if female and not male:
+    if has_female and not has_male:
         return "female"
 
     return None
@@ -187,16 +183,18 @@ def profile_channel_candidates(
     )
 
     if gender == "male":
+
         return [
             MALE_PROFILE_CHANNEL_ID
         ]
 
     if gender == "female":
+
         return [
             FEMALE_PROFILE_CHANNEL_ID
         ]
 
-    # 性別ロールが無い場合も両方探す
+    # 性別ロールなしの場合は両方検索
     return [
         MALE_PROFILE_CHANNEL_ID,
         FEMALE_PROFILE_CHANNEL_ID,
@@ -204,7 +202,7 @@ def profile_channel_candidates(
 
 
 # ============================================================
-# Embed内文字取得
+# Embedを検索用テキストへ
 # ============================================================
 
 def embed_to_text(
@@ -223,17 +221,17 @@ def embed_to_text(
             embed.description
         )
 
-    if embed.author:
-        if embed.author.name:
-            parts.append(
-                embed.author.name
-            )
+    if embed.author and embed.author.name:
 
-    if embed.footer:
-        if embed.footer.text:
-            parts.append(
-                embed.footer.text
-            )
+        parts.append(
+            embed.author.name
+        )
+
+    if embed.footer and embed.footer.text:
+
+        parts.append(
+            embed.footer.text
+        )
 
     for field in embed.fields:
 
@@ -261,11 +259,10 @@ def message_matches_member(
     member: discord.Member,
 ) -> bool:
 
-    # 本人が直接プロフィール投稿している場合
+    # 本人が直接投稿
     if (
         not message.author.bot
-        and message.author.id
-        == member.id
+        and message.author.id == member.id
     ):
         return True
 
@@ -273,13 +270,8 @@ def message_matches_member(
         member.id
     )
 
-    mention_1 = (
-        f"<@{member.id}>"
-    )
-
-    mention_2 = (
-        f"<@!{member.id}>"
-    )
+    mention_1 = f"<@{member.id}>"
+    mention_2 = f"<@!{member.id}>"
 
     content = (
         message.content
@@ -294,23 +286,23 @@ def message_matches_member(
     ):
         return True
 
-    # Discord mention情報
+    # mentions
     for user in message.mentions:
 
         if user.id == member.id:
             return True
 
-    # Embed
+    # embeds
     for embed in message.embeds:
 
-        text = embed_to_text(
+        embed_text = embed_to_text(
             embed
         )
 
         if (
-            user_id_text in text
-            or mention_1 in text
-            or mention_2 in text
+            user_id_text in embed_text
+            or mention_1 in embed_text
+            or mention_2 in embed_text
         ):
             return True
 
@@ -378,14 +370,14 @@ async def find_profile_message(
         except discord.Forbidden:
 
             log.warning(
-                "プロフィールCHを閲覧できません: %s",
+                "プロフィールCHを閲覧できません | channel=%s",
                 channel_id,
             )
 
         except discord.HTTPException:
 
             log.exception(
-                "プロフィール検索エラー: %s",
+                "プロフィール検索エラー | channel=%s",
                 channel_id,
             )
 
@@ -515,7 +507,7 @@ def create_profile_view(
 
 
 # ============================================================
-# VCのインチャへプロフィール投稿
+# VCインチャへプロフィール投稿
 # ============================================================
 
 async def post_profile_to_voice_chat(
@@ -532,6 +524,12 @@ async def post_profile_to_voice_chat(
         POST_ONCE_PER_ROOM
         and key in posted_in_room
     ):
+
+        log.info(
+            "Already posted | room=%s | user=%s",
+            channel.id,
+            member.id,
+        )
 
         return
 
@@ -597,57 +595,103 @@ async def post_profile_to_voice_chat(
 
 
 # ============================================================
-# シャベレア自動移動対応
+# シャベレア移動後の最終VC確認
 # ============================================================
 
 async def wait_for_final_voice_channel(
-    member: discord.Member,
+    guild_id: int,
+    member_id: int,
 ):
 
     try:
 
-        # シャベレアが移動させるまで待つ
         await asyncio.sleep(
             MOVE_SETTLE_SECONDS
         )
 
-        # 現在のVCを改めて取得
+        guild = client.get_guild(
+            guild_id
+        )
+
+        if guild is None:
+
+            log.warning(
+                "Guild not found while settling: %s",
+                guild_id,
+            )
+
+            return
+
+        # MemberをGuildから取り直す
+        member = guild.get_member(
+            member_id
+        )
+
+        if member is None:
+
+            try:
+
+                member = await guild.fetch_member(
+                    member_id
+                )
+
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException,
+            ):
+
+                log.warning(
+                    "Member not found: %s",
+                    member_id,
+                )
+
+                return
+
         voice_state = member.voice
 
         if voice_state is None:
+
+            log.info(
+                "No voice state after settle | user=%s",
+                member_id,
+            )
+
             return
 
         channel = voice_state.channel
 
         if channel is None:
-            return
 
-        if not isinstance(
-            channel,
-            discord.VoiceChannel,
-        ):
-            return
-
-        # --------------------------------------------
-        # 対象カテゴリー以外なら無視
-        # --------------------------------------------
-
-        if (
-            channel.category_id
-            not in PROFILE_VOICE_CATEGORY_IDS
-        ):
             return
 
         log.info(
-            "Final VC confirmed | user=%s | room=%s | category=%s",
+            "FINAL CHECK | user=%s | channel=%s | category=%s",
             member.id,
             channel.id,
             channel.category_id,
         )
 
-        # --------------------------------------------
-        # 最終的にいるVCのインチャへ投稿
-        # --------------------------------------------
+        if not isinstance(
+            channel,
+            discord.VoiceChannel,
+        ):
+
+            return
+
+        # ★ 新カテゴリーだけ監視
+        if (
+            channel.category_id
+            != PROFILE_VOICE_CATEGORY_ID
+        ):
+
+            log.info(
+                "Ignored category | user=%s | category=%s",
+                member.id,
+                channel.category_id,
+            )
+
+            return
 
         await post_profile_to_voice_chat(
             channel,
@@ -656,7 +700,11 @@ async def wait_for_final_voice_channel(
 
     except asyncio.CancelledError:
 
-        # 再移動された場合は前の待機処理を破棄
+        log.info(
+            "Settle task cancelled | user=%s",
+            member_id,
+        )
+
         return
 
     finally:
@@ -665,19 +713,19 @@ async def wait_for_final_voice_channel(
 
         if (
             settle_tasks.get(
-                member.id
+                member_id
             )
             is current_task
         ):
 
             settle_tasks.pop(
-                member.id,
+                member_id,
                 None,
             )
 
 
 # ============================================================
-# Bot起動
+# 起動
 # ============================================================
 
 @client.event
@@ -686,11 +734,7 @@ async def on_ready():
     log.info(
         "Logged in as %s (%s)",
         client.user,
-        (
-            client.user.id
-            if client.user
-            else "?"
-        ),
+        client.user.id if client.user else "?",
     )
 
     guild = client.get_guild(
@@ -706,10 +750,8 @@ async def on_ready():
         )
 
         log.info(
-            "Watching categories: %s",
-            sorted(
-                PROFILE_VOICE_CATEGORY_IDS
-            ),
+            "Watching category: %s",
+            PROFILE_VOICE_CATEGORY_ID,
         )
 
     else:
@@ -731,27 +773,24 @@ async def on_voice_state_update(
     after: discord.VoiceState,
 ):
 
+    # まず全部ログへ出す
+    log.info(
+        "VOICE EVENT | user=%s | before=%s | after=%s",
+        member.id,
+        before.channel.id if before.channel else None,
+        after.channel.id if after.channel else None,
+    )
+
     if member.bot:
         return
 
     if member.guild.id != GUILD_ID:
         return
 
-    # VC変更無し
     if before.channel == after.channel:
         return
 
-    # --------------------------------------------
-    # このユーザーの前回の待機処理をキャンセル
-    #
-    # 待機VC
-    # ↓
-    # シャベレア生成VC
-    #
-    # と短時間で動いた場合に、
-    # 待機VCへ投稿されるのを防ぐ
-    # --------------------------------------------
-
+    # 前の待機タスクがあればキャンセル
     old_task = settle_tasks.get(
         member.id
     )
@@ -763,18 +802,21 @@ async def on_voice_state_update(
 
         old_task.cancel()
 
-    # 完全退出ならここで終了
+    # 完全退出
     if after.channel is None:
+
+        log.info(
+            "Voice leave | user=%s",
+            member.id,
+        )
+
         return
 
-    # --------------------------------------------
-    # 新しい移動先が発生したら、
-    # 3秒後に「現在いるVC」を再確認
-    # --------------------------------------------
-
+    # 新しい移動先ができたら5秒待つ
     task = asyncio.create_task(
         wait_for_final_voice_channel(
-            member
+            member.guild.id,
+            member.id,
         )
     )
 
@@ -784,8 +826,7 @@ async def on_voice_state_update(
 
 
 # ============================================================
-# VC削除時
-# 投稿済みキャッシュを掃除
+# VC削除時に投稿履歴キャッシュ削除
 # ============================================================
 
 @client.event
@@ -835,30 +876,21 @@ async def on_message(
     }:
         return
 
-    # --------------------------------------------
-    # 本人が直接投稿
-    # --------------------------------------------
-
+    # 本人が直接プロフィール投稿
     if not message.author.bot:
 
         profile_cache[
             message.author.id
         ] = message.jump_url
 
-    # --------------------------------------------
     # メンション
-    # --------------------------------------------
-
     for user in message.mentions:
 
         profile_cache[
             user.id
         ] = message.jump_url
 
-    # --------------------------------------------
-    # 本文・EmbedのIDを検索
-    # --------------------------------------------
-
+    # 本文 + Embed
     searchable_text = (
         message.content
         or ""
